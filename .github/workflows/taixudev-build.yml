@@ -71,16 +71,74 @@ jobs:
           ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Identify and Rename Output APK
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p output
-          APK_PATH=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
-          if [ -f "$APK_PATH" ]; then
-            cp "$APK_PATH" output/TaiXuDev-arm64-debug.apk
-            sha256sum output/TaiXuDev-arm64-debug.apk > output/TaiXuDev-arm64-debug.apk.sha256
-            echo "APK ready: output/TaiXuDev-arm64-debug.apk"
-          else
-            echo "Error: No APK generated!" && exit 1
+
+          # 只接受 :app 的 debug 主包，排除 androidTest / benchmark 等旁路产物，
+          # 避免 head -n 1 在多变体下静默选中错误文件。
+          mapfile -t CANDIDATES < <(
+            find app/build/outputs/apk -name "*.apk" \
+              -not -name "*androidTest*" -not -name "*benchmark*" | sort
+          )
+          if [ "${#CANDIDATES[@]}" -eq 0 ]; then
+            echo "::error::No APK generated!"
+            exit 1
           fi
+          if [ "${#CANDIDATES[@]}" -gt 1 ]; then
+            printf 'candidates:\n%s\n' "$(printf '  %s\n' "${CANDIDATES[@]}")"
+            echo "::error::Expected exactly one :app debug APK, got ${#CANDIDATES[@]}"
+            exit 1
+          fi
+          APK_PATH="${CANDIDATES[0]}"
+          echo "selected: $APK_PATH"
+
+          # TAIXU_DEV_BUILD=1 必须真正生效：校验包名 / 应用名 / ABI，
+          # 否则产物会顶着 TaiXuDev 的文件名却带着正式版的身份。
+          AAPT2=""
+          for root in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk; do
+            [ -n "$root" ] && [ -d "$root/build-tools" ] || continue
+            found=$(find "$root/build-tools" -type f -name aapt2 2>/dev/null | sort -V | tail -n 1)
+            if [ -n "$found" ]; then AAPT2="$found"; break; fi
+          done
+          if [ -z "$AAPT2" ]; then
+            AAPT2=$(command -v aapt2 || true)
+          fi
+          if [ -z "$AAPT2" ]; then
+            echo "::error::aapt2 not found; cannot verify APK identity"
+            exit 1
+          fi
+          echo "aapt2: $AAPT2"
+          BADGING=$("$AAPT2" dump badging "$APK_PATH")
+
+          EXPECTED_PACKAGE="top.wkbin.taixu.dev"
+          EXPECTED_LABEL="TaiXuDev"
+          ACTUAL_PACKAGE=$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" <<<"$BADGING")
+          ACTUAL_LABEL=$(sed -n "s/^application-label:'\([^']*\)'.*/\1/p" <<<"$BADGING" | head -n 1)
+          ACTUAL_ABI=$(sed -n "s/^native-code: '\([^']*\)'.*/\1/p" <<<"$BADGING" | head -n 1)
+
+          echo "package: $ACTUAL_PACKAGE"
+          echo "label:   $ACTUAL_LABEL"
+          echo "abi:     $ACTUAL_ABI"
+
+          if [ "$ACTUAL_PACKAGE" != "$EXPECTED_PACKAGE" ]; then
+            echo "::error::Unexpected applicationId '$ACTUAL_PACKAGE' (expected '$EXPECTED_PACKAGE'); TAIXU_DEV_BUILD did not take effect"
+            exit 1
+          fi
+          if [ "$ACTUAL_LABEL" != "$EXPECTED_LABEL" ]; then
+            echo "::error::Unexpected application label '$ACTUAL_LABEL' (expected '$EXPECTED_LABEL')"
+            exit 1
+          fi
+          if [ "$ACTUAL_ABI" != "arm64-v8a" ]; then
+            echo "::error::Unexpected native-code '$ACTUAL_ABI' (expected 'arm64-v8a')"
+            exit 1
+          fi
+
+          cp "$APK_PATH" output/TaiXuDev-arm64-debug.apk
+          # 校验文件只写裸文件名：下载到任意目录后可直接 `sha256sum -c`。
+          ( cd output && sha256sum TaiXuDev-arm64-debug.apk > TaiXuDev-arm64-debug.apk.sha256 )
+          echo "APK ready: output/TaiXuDev-arm64-debug.apk"
 
       - name: Upload TaiXuDev APK Artifact
         uses: actions/upload-artifact@v4
